@@ -20,6 +20,84 @@ const instanceId = randomUUID();
 let subscriptionArn: string | undefined;
 let queueUrl: string | undefined;
 
+// State for tracking message latency
+const MAX_SAMPLES = 100;
+let latencySamples: number[] = [];
+let currentAverageLatency = 0;
+
+// Queues for different severity levels
+type Severity = "info" | "warning" | "error";
+const severityQueues: Map<
+  Severity,
+  Array<{ message: any; receiptHandle: string }>
+> = new Map([
+  ["info", []],
+  ["warning", []],
+  ["error", []],
+]);
+
+function updateLatencyAverage(newLatency: number) {
+  latencySamples.push(newLatency);
+  if (latencySamples.length > MAX_SAMPLES) {
+    latencySamples.shift();
+  }
+  currentAverageLatency =
+    latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length;
+  console.log(`Current average latency: ${currentAverageLatency.toFixed(2)}ms`);
+}
+
+async function processMessage(
+  sqsClient: SQSClient,
+  severity: Severity,
+  message: any,
+  receiptHandle: string
+) {
+  const currentTime = Date.now();
+  const messageLatency = currentTime - message.timestamp;
+  updateLatencyAverage(messageLatency);
+
+  // Simulate message processing
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  try {
+    await sqsClient.send(
+      new DeleteMessageCommand({
+        QueueUrl: queueUrl!,
+        ReceiptHandle: receiptHandle,
+      })
+    );
+  } catch (error) {
+    if (error instanceof Error) {
+      if (
+        error.name === "InvalidParameterValue" ||
+        error.name === "AWS.SimpleQueueService.NonExistentQueue"
+      ) {
+        console.log(
+          `Could not delete message with receipt handle ${receiptHandle}. This is possibly because the queue has been deleted during graceful shutdown.`
+        );
+      } else {
+        throw error;
+      }
+    } else {
+      throw error;
+    }
+  }
+}
+
+async function processSeverityQueue(sqsClient: SQSClient, severity: Severity) {
+  while (true) {
+    const queue = severityQueues.get(severity);
+    if (!queue || queue.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
+
+    const { message, receiptHandle } = queue[0];
+    await processMessage(sqsClient, severity, message, receiptHandle);
+    queue.shift();
+  }
+}
+
 async function gracefulShutdown() {
   const snsClient = new SNSClient({
     region: "us-east-1",
@@ -93,6 +171,11 @@ async function main() {
   const snsClient = new SNSClient({
     region: "us-east-1",
   });
+
+  // Start processing queues for each severity
+  const severityProcessors = ["info", "warning", "error"].map((severity) =>
+    processSeverityQueue(sqsClient, severity as Severity)
+  );
 
   console.log("Creating queue");
 
@@ -181,8 +264,11 @@ async function main() {
       const messages = receiveMessageResult.Messages;
 
       if (!messages || messages.length === 0) {
+        console.log("No messages received");
         continue;
       }
+
+      console.log(`Received ${messages.length} messages`);
 
       for (const message of messages) {
         if (!message.Body) {
@@ -190,15 +276,17 @@ async function main() {
         }
 
         const body = JSON.parse(message.Body);
+        const msg = JSON.parse(body.Message) as {
+          severity: Severity;
+          message: string;
+          timestamp: number;
+        };
 
-        console.log(body);
-
-        await sqsClient.send(
-          new DeleteMessageCommand({
-            QueueUrl: queueUrl,
-            ReceiptHandle: message.ReceiptHandle,
-          })
-        );
+        // Add message to appropriate severity queue
+        const queue = severityQueues.get(msg.severity);
+        if (queue) {
+          queue.push({ message: msg, receiptHandle: message.ReceiptHandle! });
+        }
       }
     } catch (error) {
       if (error instanceof Error) {
@@ -210,6 +298,9 @@ async function main() {
       throw error;
     }
   }
+
+  // Wait for all severity processors to complete (they won't in this case)
+  await Promise.all(severityProcessors);
 }
 
 main().catch(async (error) => {

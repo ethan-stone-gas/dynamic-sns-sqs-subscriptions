@@ -18,6 +18,7 @@ async function main() {
       Message: JSON.stringify({
         severity,
         message: `message: ${i}, severity: ${severity}`,
+        timestamp: new Date().getTime(),
       }),
       MessageGroupId: severity,
       MessageDeduplicationId: randomBytes(16).toString("hex"),
@@ -27,7 +28,9 @@ async function main() {
 
     console.log(`Published message: ${i}, severity: ${severity}`);
 
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    i++;
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
 
